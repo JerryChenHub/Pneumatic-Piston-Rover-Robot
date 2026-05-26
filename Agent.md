@@ -10,10 +10,12 @@ The Arduino controls:
 - A steering servo on **Pin 3**
 - A left rear wheel limit switch on **Pin 4**
 - A right rear wheel limit switch on **Pin 5**
+- The Compass is at SCL **PinA5**, SDA **PinA4**, The package is LSM6, by Pololu, LIS3MDL, by Pololu, only x, y direction is needed
 
 The MOSFET controls the piston actuator.  
 The servo controls steering, the code should strictly limit the angle between 65-125, otherwise it will break the steering system, also note that the steering is not symmetric on each sides.  
 The rear wheel limit switches are used only for monitoring wheel rotation.
+When the solenoid is on, the compass is interfered, so don't rely on the reading when it's on
 
 ---
 

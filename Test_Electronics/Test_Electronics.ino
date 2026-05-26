@@ -15,7 +15,7 @@ const int SERVO_START_ANGLE = 90;
 // Timing
 const unsigned long UPDATE_INTERVAL_MS = 500;
 const unsigned long SOLENOID_ON_MS = 100;
-const unsigned long SOLENOID_OFF_MS = 200;
+const unsigned long SOLENOID_OFF_MS = 400;
 
 // Serial buffer
 char rxBuffer[32];
