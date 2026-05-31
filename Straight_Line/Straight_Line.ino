@@ -1,15 +1,10 @@
 /*
-  Piston Rover control sketch
+  Piston Rover Control
 
-  Functional structure:
-    - Startup serial menu: press 1 to calibrate, press 0 to skip calibration.
-    - 10 s non-blocking compass calibration with D13 blinking at a 10 Hz full blink cycle.
-    - Sampling stage runs continuously and rejects compass readings while the piston is ON.
-    - Execution stage runs every 100 ms and performs piston timing, steering control, and logging.
-    - Piston sequence is 10 cycles of 100 ms ON and 400 ms OFF.
-
-  The compass is not sampled during piston-ON windows because the piston interferes with the magnetometer.
-  During those windows, the steering controller uses the most recent clean compass heading from piston-OFF time.
+  This sketch keeps the propeller-stand reference structure: a fast sampling
+  stage gathers valid measurements, and a timed execution stage consumes those
+  measurements and updates the actuator command. The compass is never read while
+  the piston MOSFET is ON because that interval can corrupt the magnetic field.
 */
 
 #include <Wire.h>
@@ -17,42 +12,34 @@
 #include <LIS3MDL.h>
 #include <math.h>
 
-#define ENABLE_IMU_PRINT 1
-#if ENABLE_IMU_PRINT
-#include <LSM6.h>
-#endif
-
-// ------------------------- Hardware map -------------------------
-// Rover electrical interface from Agent.md. Limit switches are configured safely but are not used for control.
+/*
+  Hardware map and fixed timing configuration.
+*/
 const byte PISTON_PIN = 2;
-const byte STEERING_SERVO_PIN = 3;
+const byte SERVO_PIN = 3;
 const byte LEFT_REAR_LIMIT_PIN = 4;
 const byte RIGHT_REAR_LIMIT_PIN = 5;
 const byte CAL_LED_PIN = 13;
 
-// ------------------------- Timing plan --------------------------
-// All scheduling uses millis(); there are no delay() calls or blocking serial waits.
-const unsigned long MENU_PROMPT_PERIOD_MS = 2000UL;
-const unsigned long CALIBRATION_TIME_MS = 10000UL;
+const unsigned long CALIBRATION_WINDOW_MS = 10000UL;
 const unsigned long CAL_LED_TOGGLE_MS = 50UL;
-const unsigned long CAL_SAMPLE_PERIOD_MS = 20UL;
-const unsigned long COMPASS_SAMPLE_PERIOD_MS = 20UL;
-const unsigned long IMU_SAMPLE_PERIOD_MS = 20UL;
-const unsigned long CONTROL_PERIOD_MS = 100UL;
-const unsigned long COMPASS_SETTLE_AFTER_PISTON_OFF_MS = 20UL;
+const unsigned long CAL_COMPASS_SAMPLE_MS = 20UL;
+const unsigned long COMPASS_SAMPLE_MS = 20UL;
+const unsigned long COMPASS_SETTLE_AFTER_OFF_MS = 20UL;
+const unsigned long EXECUTION_PERIOD_MS = 100UL;
+const unsigned long STATUS_PERIOD_MS = 500UL;
 
-// ------------------------- Piston cycle -------------------------
-// One propulsion cycle is 100 ms ON followed by 400 ms OFF, repeated ten times.
-const byte TOTAL_PISTON_CYCLES = 10;
+const unsigned int TOTAL_PISTON_CYCLES = 10;
 const unsigned long PISTON_ON_MS = 100UL;
 const unsigned long PISTON_OFF_MS = 400UL;
 
-// ------------------------- Compass calibration ------------------
-// The pre-calibration values are used when startup calibration is skipped or rejected.
-const float PRE_MIN_X = -7554.0f;
-const float PRE_MAX_X = -7410.0f;
-const float PRE_MIN_Y =   697.0f;
-const float PRE_MAX_Y =   886.0f;
+/*
+  Compass calibration values and steering tuning.
+*/
+const float PRE_MIN_X = -1162.0f;
+const float PRE_MAX_X = 1996.0f;
+const float PRE_MIN_Y =   1760.0f;
+const float PRE_MAX_Y =   4932.0f;
 const float PRE_MIN_Z =  9057.0f;
 const float PRE_MAX_Z =  9374.0f;
 
@@ -60,20 +47,11 @@ float minX = PRE_MIN_X, maxX = PRE_MAX_X;
 float minY = PRE_MIN_Y, maxY = PRE_MAX_Y;
 float minZ = PRE_MIN_Z, maxZ = PRE_MAX_Z;
 
-float calMinX, calMaxX;
-float calMinY, calMaxY;
-float calMinZ, calMaxZ;
-unsigned int calSampleCount = 0;
-
-const float MIN_VALID_CAL_SPAN = 20.0f;
+const float HEADING_OFFSET_DEG = 0.0f;
 const float HEADING_X_SIGN = 1.0f;
 const float HEADING_Y_SIGN = 1.0f;
-const float HEADING_OFFSET_DEG = 0.0f;
-const float DEG_TO_RAD_F = 0.017453292519943295f;
-const float RAD_TO_DEG_F = 57.29577951308232f;
+const float HEADING_DEADBAND_DEG = 2.0f;
 
-// ------------------------- Steering control ---------------------
-// Steering is asymmetric and always constrained to 65-125 degrees to protect the linkage.
 const int SERVO_MIN_DEG = 65;
 const int SERVO_CENTER_DEG = 90;
 const int SERVO_MAX_DEG = 125;
@@ -81,66 +59,58 @@ const int SERVO_MAX_DEG = 125;
 const float STEERING_SIGN = 1.0f;
 const float STEER_KP_LEFT = 0.75f;
 const float STEER_KP_RIGHT = 0.55f;
-const float HEADING_DEADBAND_DEG = 2.0f;
 
-// ------------------------- Runtime state ------------------------
-// State variables hold the serial menu, calibration, sensor sampling, actuator phase, and execution timing.
-Servo steeringServo;
+const bool ENABLE_STATUS_PRINTS = false;
+
+/*
+  Rover state, timing registers, and compass sample accumulation.
+*/
 LIS3MDL mag;
-
-#if ENABLE_IMU_PRINT
-LSM6 imu;
-bool imuAvailable = false;
-bool haveImuSample = false;
-long imuAx = 0, imuAy = 0, imuAz = 0;
-long imuGx = 0, imuGy = 0, imuGz = 0;
-unsigned long lastImuSampleMs = 0;
-#endif
+Servo steeringServo;
 
 enum RoverState {
-  STATE_WAIT_CAL_CHOICE,
   STATE_CALIBRATING,
-  STATE_WAIT_START,
+  STATE_START_RUN,
   STATE_RUNNING,
   STATE_DONE,
   STATE_COMPASS_ERROR
 };
 
-RoverState state = STATE_WAIT_CAL_CHOICE;
+RoverState roverState = STATE_CALIBRATING;
 
-unsigned long lastMenuPromptMs = 0;
 unsigned long calibrationStartMs = 0;
+unsigned long lastCalLedMs = 0;
 unsigned long lastCalSampleMs = 0;
-unsigned long lastLedToggleMs = 0;
-bool ledState = false;
-
 unsigned long lastCompassSampleMs = 0;
 unsigned long lastExecutionMs = 0;
-
-float sinSum = 0.0f;
-float cosSum = 0.0f;
-unsigned int cleanSampleCount = 0;
-
-bool haveCleanHeading = false;
-float lastCleanHeadingDeg = 0.0f;
-float targetHeadingDeg = 0.0f;
-float lastHeadingErrorDeg = 0.0f;
-int lastServoCommandDeg = SERVO_CENTER_DEG;
-
-float lastCompassRawX = 0.0f;
-float lastCompassRawY = 0.0f;
-float lastCompassRawZ = 0.0f;
-float lastControlHeadingDeg = 0.0f;
-
-byte pistonCyclesStarted = 0;
-byte pistonCyclesFinished = 0;
+unsigned long lastStatusMs = 0;
 unsigned long pistonPhaseStartMs = 0;
 unsigned long pistonLastOffMs = 0;
+
+bool calLedState = false;
 bool pistonIsOn = false;
 bool donePrinted = false;
 
-// ------------------------- Angle helpers ------------------------
-// Circular heading math utilities for 0-360 and signed +/-180 degree values.
+unsigned int pistonCyclesStarted = 0;
+unsigned int pistonCyclesCompleted = 0;
+
+float targetHeadingDeg = 0.0f;
+float lastCleanHeadingDeg = 0.0f;
+float lastHeadingErrorDeg = 0.0f;
+int lastServoCommandDeg = SERVO_CENTER_DEG;
+
+float sampleSinSum = 0.0f;
+float sampleCosSum = 0.0f;
+unsigned int cleanSampleCount = 0;
+unsigned int skippedControlWindows = 0;
+
+/*
+  General timing, angle, and output helpers.
+*/
+bool elapsedMs(unsigned long nowMs, unsigned long startMs, unsigned long intervalMs) {
+  return (nowMs - startMs) >= intervalMs;
+}
+
 float wrap360(float angleDeg) {
   while (angleDeg >= 360.0f) angleDeg -= 360.0f;
   while (angleDeg < 0.0f) angleDeg += 360.0f;
@@ -148,480 +118,297 @@ float wrap360(float angleDeg) {
 }
 
 float wrap180(float angleDeg) {
-  return wrap360(angleDeg + 180.0f) - 180.0f;
+  while (angleDeg > 180.0f) angleDeg -= 360.0f;
+  while (angleDeg <= -180.0f) angleDeg += 360.0f;
+  return angleDeg;
 }
 
-// ------------------------- Serial menu helpers ------------------
-// Menu handling drains available serial bytes only; it never waits for input.
-char readSerialCommand() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '0' || c == '1') return c;
+int safeServoCommand(float commandDeg) {
+  int command = (int)round(commandDeg);
+  return constrain(command, SERVO_MIN_DEG, SERVO_MAX_DEG);
+}
+
+void writeSteeringDeg(int commandDeg) {
+  lastServoCommandDeg = constrain(commandDeg, SERVO_MIN_DEG, SERVO_MAX_DEG);
+  steeringServo.write(lastServoCommandDeg);
+}
+
+void resetSampleWindow() {
+  sampleSinSum = 0.0f;
+  sampleCosSum = 0.0f;
+  cleanSampleCount = 0;
+}
+
+void setPiston(bool on, unsigned long transitionMs) {
+  if (pistonIsOn == on) return;
+
+  pistonIsOn = on;
+  digitalWrite(PISTON_PIN, on ? HIGH : LOW);
+
+  if (!on) {
+    pistonLastOffMs = transitionMs;
+    lastCompassSampleMs = transitionMs;
   }
-  return '\0';
-}
-
-void clearSerialInput() {
-  while (Serial.available() > 0) {
-    Serial.read();
-  }
-}
-
-void printCalibrationChoicePrompt() {
-  Serial.println();
-  Serial.println(F("Startup command:"));
-  Serial.println(F("  Send 1 to run 10 s compass calibration."));
-  Serial.println(F("  Send 0 to skip calibration and use the stored pre-calibration values."));
-}
-
-void printStartPrompt() {
-  Serial.println();
-  Serial.println(F("Send 1 to start the piston rover run."));
-}
-
-void repeatMenuPrompt(unsigned long nowMs, void (*promptFn)()) {
-  if (nowMs - lastMenuPromptMs >= MENU_PROMPT_PERIOD_MS) {
-    lastMenuPromptMs = nowMs;
-    promptFn();
-  }
-}
-
-// ------------------------- Actuator helpers ---------------------
-// Centralized actuator writes keep the piston state and servo safety limit consistent.
-void writeSteeringSafe(int angleDeg) {
-  angleDeg = constrain(angleDeg, SERVO_MIN_DEG, SERVO_MAX_DEG);
-  lastServoCommandDeg = angleDeg;
-  steeringServo.write(angleDeg);
-}
-
-void setPistonOff(unsigned long nowMs) {
-  pistonIsOn = false;
-  pistonLastOffMs = nowMs;
-  digitalWrite(PISTON_PIN, LOW);
-}
-
-void setPistonOn(unsigned long nowMs) {
-  pistonIsOn = true;
-  digitalWrite(PISTON_PIN, HIGH);
 }
 
 void allStop(unsigned long nowMs) {
-  setPistonOff(nowMs);
-  writeSteeringSafe(SERVO_CENTER_DEG);
+  setPiston(false, nowMs);
+  writeSteeringDeg(SERVO_CENTER_DEG);
 }
 
-// ------------------------- Compass helpers ----------------------
-// LIS3MDL raw X/Y values are normalized with the active calibration and converted to a planar heading.
-void readCompassRaw(float &x, float &y, float &z) {
+/*
+  Compass conversion and circular averaging.
+*/
+float normalizedAxis(float rawValue, float lowValue, float highValue) {
+  const float center = 0.5f * (lowValue + highValue);
+  float halfRange = 0.5f * (highValue - lowValue);
+
+  if (fabs(halfRange) < 1.0f) {
+    halfRange = 1.0f;
+  }
+
+  return (rawValue - center) / halfRange;
+}
+
+void readCompassRaw(float &rawX, float &rawY, float &rawZ) {
   mag.read();
-  x = (float)mag.m.x;
-  y = (float)mag.m.y;
-  z = (float)mag.m.z;
+  rawX = (float)mag.m.x;
+  rawY = (float)mag.m.y;
+  rawZ = (float)mag.m.z;
 }
 
-float normalizedAxis(float raw, float minVal, float maxVal) {
-  const float center = 0.5f * (minVal + maxVal);
-  float halfRange = 0.5f * (maxVal - minVal);
-  if (fabs(halfRange) < 1.0f) halfRange = 1.0f;
-  return (raw - center) / halfRange;
-}
-
-float headingFromRaw(float rawX, float rawY) {
+float headingFromRawXY(float rawX, float rawY) {
   const float x = HEADING_X_SIGN * normalizedAxis(rawX, minX, maxX);
   const float y = HEADING_Y_SIGN * normalizedAxis(rawY, minY, maxY);
-  return wrap360(atan2(y, x) * RAD_TO_DEG_F + HEADING_OFFSET_DEG);
+  return wrap360(atan2(y, x) * 180.0f / PI + HEADING_OFFSET_DEG);
 }
 
-float readHeadingDeg() {
+float readCompassHeadingDeg() {
   float rawX, rawY, rawZ;
   readCompassRaw(rawX, rawY, rawZ);
-  lastCompassRawX = rawX;
-  lastCompassRawY = rawY;
-  lastCompassRawZ = rawZ;
-  return headingFromRaw(rawX, rawY);
+  return headingFromRawXY(rawX, rawY);
 }
 
-// ------------------------- IMU logging helpers ------------------
-// The IMU is logged only. It is not used by the steering or piston controller.
-void initializeImuLogging() {
-#if ENABLE_IMU_PRINT
-  imuAvailable = imu.init();
-  if (imuAvailable) {
-    imu.enableDefault();
-    Serial.println(F("LSM6 IMU logging enabled."));
-  } else {
-    Serial.println(F("LSM6 IMU not detected; IMU field will print not_detected."));
-  }
-#else
-  Serial.println(F("IMU logging disabled at compile time."));
-#endif
+void acceptCleanHeading(float headingDeg) {
+  const float headingRad = headingDeg * PI / 180.0f;
+  sampleSinSum += sin(headingRad);
+  sampleCosSum += cos(headingRad);
+  cleanSampleCount++;
+  lastCleanHeadingDeg = headingDeg;
 }
 
-void sampleImuStage(unsigned long nowMs) {
-#if ENABLE_IMU_PRINT
-  if (!imuAvailable) return;
-  if (nowMs - lastImuSampleMs < IMU_SAMPLE_PERIOD_MS) return;
+bool consumeCleanHeadingMean(float &headingDeg) {
+  if (cleanSampleCount == 0) return false;
 
-  lastImuSampleMs = nowMs;
-  imu.read();
-  imuAx = imu.a.x;
-  imuAy = imu.a.y;
-  imuAz = imu.a.z;
-  imuGx = imu.g.x;
-  imuGy = imu.g.y;
-  imuGz = imu.g.z;
-  haveImuSample = true;
-#endif
+  headingDeg = wrap360(atan2(sampleSinSum, sampleCosSum) * 180.0f / PI);
+  lastCleanHeadingDeg = headingDeg;
+  return true;
 }
 
-void printImuFields() {
-#if ENABLE_IMU_PRINT
-  if (!imuAvailable) {
-    Serial.print(F(" IMU=not_detected"));
-    return;
-  }
-  if (!haveImuSample) {
-    Serial.print(F(" IMU=waiting"));
-    return;
-  }
-
-  Serial.print(F(" IMU_ax=")); Serial.print(imuAx);
-  Serial.print(F(" IMU_ay=")); Serial.print(imuAy);
-  Serial.print(F(" IMU_az=")); Serial.print(imuAz);
-  Serial.print(F(" IMU_gx=")); Serial.print(imuGx);
-  Serial.print(F(" IMU_gy=")); Serial.print(imuGy);
-  Serial.print(F(" IMU_gz=")); Serial.print(imuGz);
-#else
-  Serial.print(F(" IMU=disabled"));
-#endif
-}
-
-// ------------------------- Calibration stage --------------------
-// The calibration window samples extrema for 10 s while D13 blinks at a 10 Hz full blink cycle.
-void beginCalibration(unsigned long nowMs) {
-  calMinX =  1.0e9f; calMaxX = -1.0e9f;
-  calMinY =  1.0e9f; calMaxY = -1.0e9f;
-  calMinZ =  1.0e9f; calMaxZ = -1.0e9f;
-  calSampleCount = 0;
-
-  calibrationStartMs = nowMs;
-  lastCalSampleMs = nowMs;
-  lastLedToggleMs = nowMs;
-  ledState = false;
-  digitalWrite(CAL_LED_PIN, LOW);
-
-  allStop(nowMs);
-  Serial.println();
-  Serial.println(F("Compass calibration started: rotate the rover for 10 seconds."));
-  Serial.println(F("Pin 13 blinks during calibration. The controller remains non-blocking."));
-}
-
-void usePreCalibrationValues() {
+/*
+  Calibration stage. The LED blink and compass sampling are scheduled from
+  millis(), so the user gets a 10 s rotation window without blocking the loop.
+*/
+void loadPreCalibrationValues() {
   minX = PRE_MIN_X; maxX = PRE_MAX_X;
   minY = PRE_MIN_Y; maxY = PRE_MAX_Y;
   minZ = PRE_MIN_Z; maxZ = PRE_MAX_Z;
 }
 
-void sampleCalibrationCompass() {
+void beginCalibration(unsigned long nowMs) {
+  loadPreCalibrationValues();
+
+  calibrationStartMs = nowMs;
+  lastCalLedMs = nowMs;
+  lastCalSampleMs = nowMs;
+  calLedState = false;
+
+  digitalWrite(CAL_LED_PIN, LOW);
+  allStop(nowMs);
+
+  Serial.println(F("Compass calibration started. Rotate the rover for 10 seconds."));
+}
+
+void updateCalibrationBounds() {
   float rawX, rawY, rawZ;
   readCompassRaw(rawX, rawY, rawZ);
 
-  if (rawX < calMinX) calMinX = rawX;
-  if (rawX > calMaxX) calMaxX = rawX;
-  if (rawY < calMinY) calMinY = rawY;
-  if (rawY > calMaxY) calMaxY = rawY;
-  if (rawZ < calMinZ) calMinZ = rawZ;
-  if (rawZ > calMaxZ) calMaxZ = rawZ;
-
-  calSampleCount++;
+  if (rawX < minX) minX = rawX;
+  if (rawX > maxX) maxX = rawX;
+  if (rawY < minY) minY = rawY;
+  if (rawY > maxY) maxY = rawY;
+  if (rawZ < minZ) minZ = rawZ;
+  if (rawZ > maxZ) maxZ = rawZ;
 }
 
 void printCalibrationValues() {
-  Serial.println(F("Compass calibration parameters now in use:"));
+  Serial.println(F("Calibration complete. Current values:"));
   Serial.print(F("float minX = ")); Serial.print(minX, 1);
   Serial.print(F(", maxX = ")); Serial.print(maxX, 1); Serial.println(F(";"));
   Serial.print(F("float minY = ")); Serial.print(minY, 1);
   Serial.print(F(", maxY = ")); Serial.print(maxY, 1); Serial.println(F(";"));
   Serial.print(F("float minZ = ")); Serial.print(minZ, 1);
   Serial.print(F(", maxZ = ")); Serial.print(maxZ, 1); Serial.println(F(";"));
-  Serial.print(F("samples=")); Serial.print(calSampleCount);
-  Serial.print(F(" spanX=")); Serial.print(maxX - minX, 1);
-  Serial.print(F(" spanY=")); Serial.print(maxY - minY, 1);
-  Serial.print(F(" spanZ=")); Serial.println(maxZ - minZ, 1);
-}
-
-void finishCalibration(unsigned long nowMs) {
-  digitalWrite(CAL_LED_PIN, LOW);
-  ledState = false;
-
-  const float spanX = calMaxX - calMinX;
-  const float spanY = calMaxY - calMinY;
-
-  if (calSampleCount > 10 && spanX > MIN_VALID_CAL_SPAN && spanY > MIN_VALID_CAL_SPAN) {
-    minX = calMinX; maxX = calMaxX;
-    minY = calMinY; maxY = calMaxY;
-    minZ = calMinZ; maxZ = calMaxZ;
-    Serial.println(F("Compass calibration accepted."));
-  } else {
-    usePreCalibrationValues();
-    Serial.println(F("Compass calibration rejected; using stored pre-calibration values."));
-  }
-
-  printCalibrationValues();
-  allStop(nowMs);
-  clearSerialInput();
-  lastMenuPromptMs = nowMs;
-  printStartPrompt();
-  state = STATE_WAIT_START;
 }
 
 void calibrationStage(unsigned long nowMs) {
-  if (nowMs - lastLedToggleMs >= CAL_LED_TOGGLE_MS) {
-    lastLedToggleMs = nowMs;
-    ledState = !ledState;
-    digitalWrite(CAL_LED_PIN, ledState ? HIGH : LOW);
+  if (elapsedMs(nowMs, lastCalLedMs, CAL_LED_TOGGLE_MS)) {
+    lastCalLedMs += CAL_LED_TOGGLE_MS;
+    calLedState = !calLedState;
+    digitalWrite(CAL_LED_PIN, calLedState ? HIGH : LOW);
   }
 
-  if (nowMs - lastCalSampleMs >= CAL_SAMPLE_PERIOD_MS) {
-    lastCalSampleMs = nowMs;
-    sampleCalibrationCompass();
+  if (elapsedMs(nowMs, lastCalSampleMs, CAL_COMPASS_SAMPLE_MS)) {
+    lastCalSampleMs += CAL_COMPASS_SAMPLE_MS;
+    updateCalibrationBounds();
   }
 
-  if (nowMs - calibrationStartMs >= CALIBRATION_TIME_MS) {
-    finishCalibration(nowMs);
-  }
-}
-
-void waitForCalibrationChoice(unsigned long nowMs) {
-  const char cmd = readSerialCommand();
-
-  if (cmd == '1') {
-    beginCalibration(nowMs);
-    state = STATE_CALIBRATING;
-    return;
-  }
-
-  if (cmd == '0') {
-    usePreCalibrationValues();
-    calSampleCount = 0;
-    Serial.println();
-    Serial.println(F("Compass calibration skipped."));
+  if (elapsedMs(nowMs, calibrationStartMs, CALIBRATION_WINDOW_MS)) {
+    digitalWrite(CAL_LED_PIN, LOW);
     printCalibrationValues();
-    allStop(nowMs);
-    clearSerialInput();
-    lastMenuPromptMs = nowMs;
-    printStartPrompt();
-    state = STATE_WAIT_START;
-    return;
+    roverState = STATE_START_RUN;
   }
-
-  repeatMenuPrompt(nowMs, printCalibrationChoicePrompt);
 }
 
-void startRun(unsigned long nowMs);
-
-void waitForStartCommand(unsigned long nowMs) {
-  const char cmd = readSerialCommand();
-
-  if (cmd == '1') {
-    startRun(nowMs);
-    return;
-  }
-
-  repeatMenuPrompt(nowMs, printStartPrompt);
-}
-
-// ------------------------- Sampling stage -----------------------
-// Compass samples are accumulated only during clean piston-OFF windows; IMU samples are logged separately.
-void resetSampleWindow() {
-  sinSum = 0.0f;
-  cosSum = 0.0f;
-  cleanSampleCount = 0;
-}
-
-void sampleCompassStage(unsigned long nowMs) {
+/*
+  Sampling stage. Compass samples are accepted only when the piston has been OFF
+  long enough for the magnetic disturbance to settle.
+*/
+void samplingStage(unsigned long nowMs) {
   if (pistonIsOn) return;
-  if (nowMs - pistonLastOffMs < COMPASS_SETTLE_AFTER_PISTON_OFF_MS) return;
-  if (nowMs - lastCompassSampleMs < COMPASS_SAMPLE_PERIOD_MS) return;
+  if (!elapsedMs(nowMs, pistonLastOffMs, COMPASS_SETTLE_AFTER_OFF_MS)) return;
+  if (!elapsedMs(nowMs, lastCompassSampleMs, COMPASS_SAMPLE_MS)) return;
 
-  lastCompassSampleMs = nowMs;
-  const float headingDeg = readHeadingDeg();
-
-  lastCleanHeadingDeg = headingDeg;
-  haveCleanHeading = true;
-  sinSum += sin(headingDeg * DEG_TO_RAD_F);
-  cosSum += cos(headingDeg * DEG_TO_RAD_F);
-  cleanSampleCount++;
+  lastCompassSampleMs += COMPASS_SAMPLE_MS;
+  acceptCleanHeading(readCompassHeadingDeg());
 }
 
-void sampleStage(unsigned long nowMs) {
-  sampleCompassStage(nowMs);
-  sampleImuStage(nowMs);
-}
-
-bool headingForControl(float &headingDeg, bool &usedNewCleanSamples) {
-  usedNewCleanSamples = false;
-
-  if (cleanSampleCount > 0) {
-    headingDeg = wrap360(atan2(sinSum, cosSum) * RAD_TO_DEG_F);
-    lastCleanHeadingDeg = headingDeg;
-    haveCleanHeading = true;
-    usedNewCleanSamples = true;
-    return true;
-  }
-
-  if (haveCleanHeading) {
-    headingDeg = lastCleanHeadingDeg;
-    return true;
-  }
-
-  return false;
-}
-
-// ------------------------- Execution stage ----------------------
-// Every 100 ms, this stage advances piston phase, updates steering, and prints a one-line status packet.
-void updatePistonSchedule(unsigned long nowMs) {
-  if (pistonCyclesFinished >= TOTAL_PISTON_CYCLES) {
-    setPistonOff(nowMs);
-    state = STATE_DONE;
-    return;
-  }
-
-  const unsigned long phaseDuration = pistonIsOn ? PISTON_ON_MS : PISTON_OFF_MS;
-  if (nowMs - pistonPhaseStartMs < phaseDuration) return;
-
-  pistonPhaseStartMs = nowMs;
-
-  if (pistonIsOn) {
-    setPistonOff(nowMs);
-    return;
-  }
-
-  pistonCyclesFinished++;
-
-  if (pistonCyclesFinished >= TOTAL_PISTON_CYCLES) {
-    setPistonOff(nowMs);
-    state = STATE_DONE;
-    return;
-  }
-
-  pistonCyclesStarted++;
-  setPistonOn(nowMs);
-}
-
+/*
+  Execution stage. This runs every 100 ms. Steering is updated only from clean
+  OFF-phase compass samples; an execution tick that begins during piston ON holds
+  the previous steering command and then advances the piston schedule.
+*/
 void updateSteeringFromHeading(float measuredHeadingDeg) {
   lastHeadingErrorDeg = wrap180(targetHeadingDeg - measuredHeadingDeg);
+
   float signedErrorDeg = STEERING_SIGN * lastHeadingErrorDeg;
 
-  if (fabs(signedErrorDeg) < HEADING_DEADBAND_DEG) signedErrorDeg = 0.0f;
-
-  const float kp = (signedErrorDeg < 0.0f) ? STEER_KP_LEFT : STEER_KP_RIGHT;
-  const int commandDeg = (int)round((float)SERVO_CENTER_DEG + kp * signedErrorDeg);
-  writeSteeringSafe(commandDeg);
-}
-
-void printExecutionParameters(unsigned long nowMs, bool usedNewCleanSamples, bool hadHeadingForControl) {
-  const unsigned long phaseElapsedMs = nowMs - pistonPhaseStartMs;
-  const unsigned long phaseTargetMs = pistonIsOn ? PISTON_ON_MS : PISTON_OFF_MS;
-
-  Serial.print(F("exec_ms=")); Serial.print(nowMs);
-  Serial.print(F(" cycle_started=")); Serial.print(pistonCyclesStarted);
-  Serial.print(F(" cycle_finished=")); Serial.print(pistonCyclesFinished);
-  Serial.print(F(" piston=")); Serial.print(pistonIsOn ? F("ON") : F("OFF"));
-  Serial.print(F(" on_ms=")); Serial.print(PISTON_ON_MS);
-  Serial.print(F(" off_ms=")); Serial.print(PISTON_OFF_MS);
-  Serial.print(F(" phase_elapsed_ms=")); Serial.print(phaseElapsedMs);
-  Serial.print(F(" phase_target_ms=")); Serial.print(phaseTargetMs);
-
-  Serial.print(F(" compass_source="));
-  if (!hadHeadingForControl) {
-    Serial.print(F("none"));
-  } else if (usedNewCleanSamples) {
-    Serial.print(F("new_clean_off_window"));
-  } else {
-    Serial.print(F("last_clean"));
+  if (fabs(signedErrorDeg) < HEADING_DEADBAND_DEG) {
+    signedErrorDeg = 0.0f;
   }
 
-  Serial.print(F(" compass_heading_deg=")); Serial.print(lastControlHeadingDeg, 2);
-  Serial.print(F(" compass_target_deg=")); Serial.print(targetHeadingDeg, 2);
-  Serial.print(F(" compass_error_deg=")); Serial.print(lastHeadingErrorDeg, 2);
-  Serial.print(F(" compass_raw_x=")); Serial.print(lastCompassRawX, 0);
-  Serial.print(F(" compass_raw_y=")); Serial.print(lastCompassRawY, 0);
-  Serial.print(F(" compass_raw_z=")); Serial.print(lastCompassRawZ, 0);
+  const float kp = (signedErrorDeg >= 0.0f) ? STEER_KP_RIGHT : STEER_KP_LEFT;
+  const float commandDeg = (float)SERVO_CENTER_DEG + kp * signedErrorDeg;
+  writeSteeringDeg(safeServoCommand(commandDeg));
+}
 
-  printImuFields();
+void updatePistonSchedule(unsigned long nowMs) {
+  if (pistonCyclesCompleted >= TOTAL_PISTON_CYCLES) {
+    setPiston(false, nowMs);
+    return;
+  }
 
-  Serial.print(F(" steering_deg=")); Serial.print(lastServoCommandDeg);
-  Serial.print(F(" steering_min=")); Serial.print(SERVO_MIN_DEG);
-  Serial.print(F(" steering_max=")); Serial.print(SERVO_MAX_DEG);
-  Serial.print(F(" state=")); Serial.println(state == STATE_DONE ? F("DONE") : F("RUNNING"));
+  if (pistonIsOn) {
+    if (elapsedMs(nowMs, pistonPhaseStartMs, PISTON_ON_MS)) {
+      pistonPhaseStartMs = nowMs;
+      setPiston(false, nowMs);
+    }
+    return;
+  }
+
+  if (elapsedMs(nowMs, pistonPhaseStartMs, PISTON_OFF_MS)) {
+    pistonCyclesCompleted = pistonCyclesStarted;
+
+    if (pistonCyclesCompleted >= TOTAL_PISTON_CYCLES) {
+      setPiston(false, nowMs);
+      return;
+    }
+
+    pistonCyclesStarted++;
+    pistonPhaseStartMs = nowMs;
+    resetSampleWindow();
+    setPiston(true, nowMs);
+  }
+}
+
+void printStatus(unsigned long nowMs, bool usedCleanHeading, bool tickStartedWithPistonOn) {
+  if (!ENABLE_STATUS_PRINTS) return;
+  if (!elapsedMs(nowMs, lastStatusMs, STATUS_PERIOD_MS)) return;
+
+  lastStatusMs += STATUS_PERIOD_MS;
+
+  Serial.print(F("started=")); Serial.print(pistonCyclesStarted);
+  Serial.print(F(" completed=")); Serial.print(pistonCyclesCompleted);
+  Serial.print(F(" piston=")); Serial.print(pistonIsOn ? F("ON") : F("OFF"));
+  Serial.print(F(" control="));
+  Serial.print(usedCleanHeading ? F("updated") : (tickStartedWithPistonOn ? F("held_piston_on") : F("held_no_sample")));
+  Serial.print(F(" target=")); Serial.print(targetHeadingDeg, 1);
+  Serial.print(F(" heading=")); Serial.print(lastCleanHeadingDeg, 1);
+  Serial.print(F(" error=")); Serial.print(lastHeadingErrorDeg, 1);
+  Serial.print(F(" servo=")); Serial.print(lastServoCommandDeg);
+  Serial.print(F(" skipped=")); Serial.println(skippedControlWindows);
 }
 
 void executionStage(unsigned long nowMs) {
-  updatePistonSchedule(nowMs);
+  const bool tickStartedWithPistonOn = pistonIsOn;
+  bool usedCleanHeading = false;
+  float measuredHeadingDeg = lastCleanHeadingDeg;
 
-  float controlHeadingDeg = lastCleanHeadingDeg;
-  bool usedNewCleanSamples = false;
-  bool hadHeadingForControl = false;
-
-  if (state != STATE_DONE) {
-    hadHeadingForControl = headingForControl(controlHeadingDeg, usedNewCleanSamples);
-    if (hadHeadingForControl) {
-      lastControlHeadingDeg = controlHeadingDeg;
-      updateSteeringFromHeading(controlHeadingDeg);
-    }
-  } else {
-    allStop(nowMs);
-    hadHeadingForControl = haveCleanHeading;
-    lastControlHeadingDeg = lastCleanHeadingDeg;
+  if (!tickStartedWithPistonOn) {
+    usedCleanHeading = consumeCleanHeadingMean(measuredHeadingDeg);
   }
 
-  printExecutionParameters(nowMs, usedNewCleanSamples, hadHeadingForControl);
+  if (usedCleanHeading) {
+    updateSteeringFromHeading(measuredHeadingDeg);
+  } else {
+    skippedControlWindows++;
+  }
+
   resetSampleWindow();
+  updatePistonSchedule(nowMs);
+  printStatus(nowMs, usedCleanHeading, tickStartedWithPistonOn);
+
+  if (pistonCyclesCompleted >= TOTAL_PISTON_CYCLES && !pistonIsOn) {
+    allStop(nowMs);
+    roverState = STATE_DONE;
+  }
 }
 
-// ------------------------- Run initialization -------------------
-// The rover locks the current compass heading before energizing the piston and then enters the 100 ms execution loop.
+/*
+  Run startup and Arduino entry points.
+*/
 void startRun(unsigned long nowMs) {
   allStop(nowMs);
+  writeSteeringDeg(SERVO_CENTER_DEG);
 
-  targetHeadingDeg = readHeadingDeg();
+  targetHeadingDeg = readCompassHeadingDeg();
   lastCleanHeadingDeg = targetHeadingDeg;
-  lastControlHeadingDeg = targetHeadingDeg;
-  haveCleanHeading = true;
   lastHeadingErrorDeg = 0.0f;
 
   resetSampleWindow();
   lastCompassSampleMs = nowMs;
   lastExecutionMs = nowMs;
-
-#if ENABLE_IMU_PRINT
-  lastImuSampleMs = 0;
-  haveImuSample = false;
-#endif
+  lastStatusMs = nowMs;
+  skippedControlWindows = 0;
+  donePrinted = false;
 
   pistonCyclesStarted = 1;
-  pistonCyclesFinished = 0;
+  pistonCyclesCompleted = 0;
   pistonPhaseStartMs = nowMs;
-  donePrinted = false;
-  setPistonOn(nowMs);
-  writeSteeringSafe(SERVO_CENTER_DEG);
+  setPiston(true, nowMs);
 
-  Serial.println();
-  Serial.print(F("Run started. Holding initial heading_deg="));
+  Serial.print(F("Run started. Holding initial heading: "));
   Serial.println(targetHeadingDeg, 2);
-  Serial.println(F("Execution period is 100 ms. Compass readings are ignored while piston is ON."));
+  Serial.println(F("Execution period: 100 ms. Compass and steering update are skipped while piston is ON."));
 
-  state = STATE_RUNNING;
+  roverState = STATE_RUNNING;
 }
 
-// ------------------------- Arduino setup and loop ---------------
-// The main loop dispatches the active state; sensor sampling is continuous and execution is gated at 100 ms.
 void setup() {
   pinMode(PISTON_PIN, OUTPUT);
+  pinMode(CAL_LED_PIN, OUTPUT);
   pinMode(LEFT_REAR_LIMIT_PIN, INPUT_PULLUP);
   pinMode(RIGHT_REAR_LIMIT_PIN, INPUT_PULLUP);
-  pinMode(CAL_LED_PIN, OUTPUT);
 
   digitalWrite(PISTON_PIN, LOW);
   digitalWrite(CAL_LED_PIN, LOW);
@@ -629,51 +416,44 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
 
-  steeringServo.attach(STEERING_SERVO_PIN);
-  writeSteeringSafe(SERVO_CENTER_DEG);
+  steeringServo.attach(SERVO_PIN);
+  writeSteeringDeg(SERVO_CENTER_DEG);
 
   if (!mag.init()) {
     Serial.println(F("ERROR: LIS3MDL compass not detected. Rover stopped."));
-    state = STATE_COMPASS_ERROR;
+    roverState = STATE_COMPASS_ERROR;
+    allStop(millis());
     return;
   }
 
   mag.enableDefault();
-  initializeImuLogging();
-
-  usePreCalibrationValues();
-  lastMenuPromptMs = millis();
-  printCalibrationChoicePrompt();
+  beginCalibration(millis());
 }
 
 void loop() {
   const unsigned long nowMs = millis();
 
-  switch (state) {
-    case STATE_WAIT_CAL_CHOICE:
-      waitForCalibrationChoice(nowMs);
-      break;
-
+  switch (roverState) {
     case STATE_CALIBRATING:
       calibrationStage(nowMs);
       break;
 
-    case STATE_WAIT_START:
-      waitForStartCommand(nowMs);
+    case STATE_START_RUN:
+      startRun(nowMs);
       break;
 
     case STATE_RUNNING:
-      sampleStage(nowMs);
-      if (nowMs - lastExecutionMs >= CONTROL_PERIOD_MS) {
-        lastExecutionMs = nowMs;
+      samplingStage(nowMs);
+      if (elapsedMs(nowMs, lastExecutionMs, EXECUTION_PERIOD_MS)) {
+        lastExecutionMs += EXECUTION_PERIOD_MS;
         executionStage(nowMs);
       }
       break;
 
     case STATE_DONE:
+      allStop(nowMs);
       if (!donePrinted) {
         donePrinted = true;
-        allStop(nowMs);
         Serial.println(F("Run complete. Piston OFF, steering centered."));
       }
       break;
@@ -681,7 +461,11 @@ void loop() {
     case STATE_COMPASS_ERROR:
     default:
       allStop(nowMs);
-      digitalWrite(CAL_LED_PIN, HIGH);
+      if (elapsedMs(nowMs, lastCalLedMs, 500UL)) {
+        lastCalLedMs = nowMs;
+        calLedState = !calLedState;
+        digitalWrite(CAL_LED_PIN, calLedState ? HIGH : LOW);
+      }
       break;
   }
 }
