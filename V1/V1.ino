@@ -3,9 +3,16 @@
     - Startup compass calibration runs for COMPASS_CAL_MS.
     - The heading at the end of calibration becomes the initial heading.
     - Stage 1: drive straight for STAGE1_DISTANCE_M.
-    - Turn: keep a fixed steering command until the compass heading changes by TURN_ANGLE_DEG.
+    - Turn right by RIGHT_TURN_ANGLE_DEG with a fixed steering command.
     - Stage 2: center steering, then drive straight for STAGE2_DISTANCE_M.
-    - Stop piston and center steering after Stage 2.
+    - Turn left by LEFT_TURN_ANGLE_DEG with a fixed steering command.
+    - Stage 3: center steering, then drive straight for STAGE3_DISTANCE_M.
+    - Stop the piston and center steering after Stage 3.
+
+  Piston rule:
+    - The first PISTON_PROFILE_1_CYCLES cycles use PISTON_PROFILE_1_ON_MS.
+    - The next PISTON_PROFILE_2_CYCLES cycles use PISTON_PROFILE_2_ON_MS.
+    - Later cycles use PISTON_DEFAULT_ON_MS.
 
   Compass rule:
     - The piston disturbs compass readings.
@@ -34,9 +41,11 @@
 /* ============================= User Config ============================= */
 
 // Mission profile.
-const float STAGE1_DISTANCE_M = 3.0f;                // First straight distance.
-const float TURN_ANGLE_DEG = 90.0f;                  // Right-turn heading change.
-const float STAGE2_DISTANCE_M = 10.0f;                // Second straight/cruise distance.
+const float STAGE1_DISTANCE_M = 3.5f;                // First straight distance.
+const float RIGHT_TURN_ANGLE_DEG = 90.0f;            // Heading change for the right turn.
+const float STAGE2_DISTANCE_M = 17.0f;               // Second straight/cruise distance.
+const float LEFT_TURN_ANGLE_DEG = 90.0f;             // Heading change for the left turn.
+const float STAGE3_DISTANCE_M = 3f;                // Final straight distance after the left turn.
 const float TURN_DONE_TOL_DEG = 2.0f;                // Turn is done at target - tolerance.
 const uint8_t TURN_DONE_CONFIRM_SAMPLES = 2;         // Consecutive 10 Hz confirmations.
 
@@ -52,7 +61,11 @@ const uint32_t SERIAL_BAUD = 1000000UL;
 const uint16_t SAMPLE_MS = 10;                       // 100 Hz sample/log cycle.
 const uint16_t DECISION_MS = 100;                    // 10 Hz steering decision cycle.
 const uint16_t PISTON_PERIOD_MS = 1000;
-const uint16_t PISTON_ON_MS = 250;
+const uint16_t PISTON_PROFILE_1_ON_MS = 300;         // ON time for the first profile.
+const uint8_t PISTON_PROFILE_1_CYCLES = 4;           // Number of cycles using profile 1.
+const uint16_t PISTON_PROFILE_2_ON_MS = 200;         // ON time for the second profile.
+const uint8_t PISTON_PROFILE_2_CYCLES = 3;           // Number of cycles after profile 1.
+const uint16_t PISTON_DEFAULT_ON_MS = 200;           // ON time after profiles 1 and 2.
 const uint16_t COMPASS_SETTLE_AFTER_OFF_MS = 20;
 const uint16_t COMPASS_CAL_MS = 10000;
 const uint16_t CAL_LED_TOGGLE_MS = 250;
@@ -62,12 +75,14 @@ const uint32_t LIMIT_DEBOUNCE_US = 3000UL;
 // Steering.
 const int SERVO_PHYS_MIN_DEG = 65;
 const int SERVO_PHYS_MAX_DEG = 125;
-const int SERVO_STRAIGHT_MIN_DEG = 85;
-const int SERVO_STRAIGHT_MAX_DEG = 97;
-const int SERVO_CENTER_TRIM_DEG = 90;                // Tune if actual center is not 90.
+const int SERVO_STRAIGHT_MIN_DEG = 82;
+const int SERVO_STRAIGHT_MAX_DEG = 100;
+const int SERVO_CENTER_TRIM_DEG = 91;                // Tune if actual center is not 90.
 const int STEERING_SIGN = -1;                        // Flip if PID correction direction is reversed.
-const int TURN_SERVO_DEG = 110;                      // Fixed right-turn steering command.
+const int RIGHT_TURN_SERVO_DEG = 110;                // Fixed right-turn steering command.
+const int LEFT_TURN_SERVO_DEG = 75;                  // Fixed left-turn steering command.
 const int RIGHT_TURN_HEADING_SIGN = +1;              // Use -1 if right turn decreases compass heading.
+const int LEFT_TURN_HEADING_SIGN = -1;               // Use +1 if left turn increases compass heading.
 
 // Wheel and chassis geometry.
 const float TRACK_WIDTH_M = 0.188f;                  // 188 mm.
@@ -115,7 +130,9 @@ enum RoverPhase {
   PHASE_STRAIGHT_1 = 0,
   PHASE_TURN_RIGHT = 1,
   PHASE_STRAIGHT_2 = 2,
-  PHASE_DONE = 3
+  PHASE_TURN_LEFT = 3,
+  PHASE_STRAIGHT_3 = 4,
+  PHASE_DONE = 5
 };
 
 RoverPhase phase = PHASE_STRAIGHT_1;
@@ -151,6 +168,9 @@ float magMaxZ = MAG_MAX_Z_PRESET;
 float initialHeadingDeg = NAN;
 float targetHeadingDeg = NAN;
 float rightTurnTargetHeadingDeg = NAN;
+float leftTurnTargetHeadingDeg = NAN;
+float turnStartHeadingDeg = NAN;
+float activeTurnAngleDeg = NAN;
 float lastCompassDeg = NAN;
 float headingErrDeg = 0.0f;
 
@@ -158,6 +178,9 @@ float distanceM = 0.0f;
 float turnProgressDeg = NAN;
 float turnRadiusM = NAN;
 float turnWheelAngleDeg = NAN;
+
+int activeTurnServoDeg = SERVO_CENTER_TRIM_DEG;
+int activeTurnHeadingSign = RIGHT_TURN_HEADING_SIGN;
 
 float errIntegral = 0.0f;
 float lastErrDeg = 0.0f;
@@ -232,12 +255,17 @@ void resetSegmentDistanceCounts() {
 float currentStraightTargetDistanceM() {
   if (phase == PHASE_STRAIGHT_1) return STAGE1_DISTANCE_M;
   if (phase == PHASE_STRAIGHT_2) return STAGE2_DISTANCE_M;
+  if (phase == PHASE_STRAIGHT_3) return STAGE3_DISTANCE_M;
   return NAN;
 }
 
-float turnProgressFromInitialHeading() {
-  if (isnan(lastCompassDeg) || isnan(initialHeadingDeg)) return NAN;
-  return RIGHT_TURN_HEADING_SIGN * wrap180(lastCompassDeg - initialHeadingDeg);
+bool isTurnPhase() {
+  return phase == PHASE_TURN_RIGHT || phase == PHASE_TURN_LEFT;
+}
+
+float turnProgressFromStartHeading() {
+  if (isnan(lastCompassDeg) || isnan(turnStartHeadingDeg)) return NAN;
+  return activeTurnHeadingSign * wrap180(lastCompassDeg - turnStartHeadingDeg);
 }
 
 void failStop(const __FlashStringHelper *message) {
@@ -489,6 +517,15 @@ void setPiston(bool on, uint32_t nowUs) {
   if (!on) pistonLastOffUs = nowUs;
 }
 
+uint16_t currentPistonOnMs() {
+  uint32_t profile1EndCycle = PISTON_PROFILE_1_CYCLES;
+  uint32_t profile2EndCycle = profile1EndCycle + PISTON_PROFILE_2_CYCLES;
+
+  if (pistonCycles <= profile1EndCycle) return PISTON_PROFILE_1_ON_MS;
+  if (pistonCycles <= profile2EndCycle) return PISTON_PROFILE_2_ON_MS;
+  return PISTON_DEFAULT_ON_MS;
+}
+
 void updatePiston(uint32_t nowMs, uint32_t nowUs) {
   if (roverDone) {
     setPiston(false, nowUs);
@@ -502,7 +539,7 @@ void updatePiston(uint32_t nowMs, uint32_t nowUs) {
     elapsedMs = 0;
   }
 
-  setPiston(elapsedMs < PISTON_ON_MS, nowUs);
+  setPiston(elapsedMs < currentPistonOnMs(), nowUs);
 }
 
 bool compassSafe(uint32_t nowUs) {
@@ -537,15 +574,24 @@ void updateTurnGeometryFromLimitSwitches() {
   }
 }
 
-void beginRightTurn() {
-  phase = PHASE_TURN_RIGHT;
+void beginTurn(RoverPhase turnPhase,
+               float turnTargetHeadingDeg,
+               float turnAngleDeg,
+               int turnServoDeg,
+               int headingSign) {
+  phase = turnPhase;
   turnStartLeftCount = wheel.leftCount;
   turnStartRightCount = wheel.rightCount;
+  turnStartHeadingDeg = targetHeadingDeg;
 
   resetSegmentDistanceCounts();
   resetPidState();
 
-  targetHeadingDeg = rightTurnTargetHeadingDeg;
+  targetHeadingDeg = turnTargetHeadingDeg;
+  activeTurnAngleDeg = turnAngleDeg;
+  activeTurnServoDeg = turnServoDeg;
+  activeTurnHeadingSign = headingSign;
+
   headingErrDeg = wrap180(lastCompassDeg - targetHeadingDeg);
   turnProgressDeg = 0.0f;
   turnRadiusM = NAN;
@@ -553,20 +599,50 @@ void beginRightTurn() {
   turnDoneConfirmCount = 0;
   compassUpdatedSinceDecision = false;
 
-  writeServoDeg(TURN_SERVO_DEG);
+  writeServoDeg(activeTurnServoDeg);
 }
 
-void beginSecondStraight() {
-  phase = PHASE_STRAIGHT_2;
+void beginRightTurn() {
+  beginTurn(PHASE_TURN_RIGHT,
+            rightTurnTargetHeadingDeg,
+            RIGHT_TURN_ANGLE_DEG,
+            RIGHT_TURN_SERVO_DEG,
+            RIGHT_TURN_HEADING_SIGN);
+}
+
+void beginLeftTurn() {
+  beginTurn(PHASE_TURN_LEFT,
+            leftTurnTargetHeadingDeg,
+            LEFT_TURN_ANGLE_DEG,
+            LEFT_TURN_SERVO_DEG,
+            LEFT_TURN_HEADING_SIGN);
+}
+
+void beginStraight(RoverPhase straightPhase, float straightTargetHeadingDeg) {
+  phase = straightPhase;
   resetSegmentDistanceCounts();
   resetPidState();
 
-  targetHeadingDeg = rightTurnTargetHeadingDeg;
+  targetHeadingDeg = straightTargetHeadingDeg;
   headingErrDeg = wrap180(lastCompassDeg - targetHeadingDeg);
+  turnStartHeadingDeg = NAN;
+  activeTurnAngleDeg = NAN;
+  activeTurnServoDeg = SERVO_CENTER_TRIM_DEG;
+  turnProgressDeg = NAN;
+  turnRadiusM = NAN;
+  turnWheelAngleDeg = NAN;
   turnDoneConfirmCount = 0;
   compassUpdatedSinceDecision = false;
 
   writeServoDeg(SERVO_CENTER_TRIM_DEG);
+}
+
+void beginSecondStraight() {
+  beginStraight(PHASE_STRAIGHT_2, rightTurnTargetHeadingDeg);
+}
+
+void beginThirdStraight() {
+  beginStraight(PHASE_STRAIGHT_3, leftTurnTargetHeadingDeg);
 }
 
 void finishRover() {
@@ -581,28 +657,33 @@ void updateDistanceFromLimitSwitches() {
   uint32_t rightTicks = wheel.rightCount - startRightCount;
   distanceM = 0.5f * (float)(leftTicks + rightTicks) * TICK_M;
 
-  if (phase == PHASE_TURN_RIGHT) updateTurnGeometryFromLimitSwitches();
+  if (isTurnPhase()) updateTurnGeometryFromLimitSwitches();
 
   float targetDistanceM = currentStraightTargetDistanceM();
   if (isnan(targetDistanceM) || distanceM < targetDistanceM) return;
 
   if (phase == PHASE_STRAIGHT_1) beginRightTurn();
-  else if (phase == PHASE_STRAIGHT_2) finishRover();
+  else if (phase == PHASE_STRAIGHT_2) beginLeftTurn();
+  else if (phase == PHASE_STRAIGHT_3) finishRover();
 }
 
 void updateTurnDecision() {
   resetPidState();
-  writeServoDeg(TURN_SERVO_DEG);
+  writeServoDeg(activeTurnServoDeg);
 
   if (!compassUpdatedSinceDecision) return;
   compassUpdatedSinceDecision = false;
 
-  turnProgressDeg = turnProgressFromInitialHeading();
+  turnProgressDeg = turnProgressFromStartHeading();
   bool turnDone = !isnan(turnProgressDeg) &&
-                  turnProgressDeg >= TURN_ANGLE_DEG - TURN_DONE_TOL_DEG;
+                  !isnan(activeTurnAngleDeg) &&
+                  turnProgressDeg >= activeTurnAngleDeg - TURN_DONE_TOL_DEG;
   turnDoneConfirmCount = turnDone ? turnDoneConfirmCount + 1 : 0;
 
-  if (turnDoneConfirmCount >= TURN_DONE_CONFIRM_SAMPLES) beginSecondStraight();
+  if (turnDoneConfirmCount < TURN_DONE_CONFIRM_SAMPLES) return;
+
+  if (phase == PHASE_TURN_RIGHT) beginSecondStraight();
+  else if (phase == PHASE_TURN_LEFT) beginThirdStraight();
 }
 
 void updateStraightSteering(uint32_t nowMs) {
@@ -633,14 +714,14 @@ void updateSteering(uint32_t nowMs) {
     return;
   }
 
-  if (phase == PHASE_TURN_RIGHT) updateTurnDecision();
+  if (isTurnPhase()) updateTurnDecision();
   else updateStraightSteering(nowMs);
 }
 
 /* ================================ Logging ================================ */
 
 void printHeader() {
-  Serial.println(F("t_ms,piston,cycle,Lcnt,Rcnt,dist_m,target_deg,mag_deg,err_deg,pid_deg,servo_deg,done,phase,turn_target_deg,turn_progress_deg,turn_radius_m,turn_wheel_angle_deg,turn_confirm,L_dt_ms,R_dt_ms"));
+  Serial.println(F("t_ms,piston,cycle,piston_on_ms,Lcnt,Rcnt,dist_m,target_deg,mag_deg,err_deg,pid_deg,servo_deg,done,phase,turn_start_deg,turn_angle_deg,turn_progress_deg,turn_radius_m,turn_wheel_angle_deg,turn_confirm,L_dt_ms,R_dt_ms"));
 }
 
 void printSample(uint32_t nowMs) {
@@ -649,6 +730,7 @@ void printSample(uint32_t nowMs) {
   Serial.print(nowMs); Serial.print(',');
   Serial.print(pistonOn ? 1 : 0); Serial.print(',');
   Serial.print(pistonCycles); Serial.print(',');
+  Serial.print(currentPistonOnMs()); Serial.print(',');
   Serial.print(wheel.leftCount); Serial.print(',');
   Serial.print(wheel.rightCount); Serial.print(',');
   Serial.print(distanceM, 4); Serial.print(',');
@@ -659,7 +741,8 @@ void printSample(uint32_t nowMs) {
   Serial.print(lastServoDeg); Serial.print(',');
   Serial.print(roverDone ? 1 : 0); Serial.print(',');
   Serial.print((int)phase); Serial.print(',');
-  printFloatOrNan(rightTurnTargetHeadingDeg, 2); Serial.print(',');
+  printFloatOrNan(turnStartHeadingDeg, 2); Serial.print(',');
+  printFloatOrNan(activeTurnAngleDeg, 2); Serial.print(',');
   printFloatOrNan(turnProgressDeg, 2); Serial.print(',');
   printFloatOrNan(turnRadiusM, 4); Serial.print(',');
   printFloatOrNan(turnWheelAngleDeg, 2); Serial.print(',');
@@ -700,7 +783,8 @@ void setup() {
 
   initialHeadingDeg = averageCompassHeading(25);
   targetHeadingDeg = initialHeadingDeg;
-  rightTurnTargetHeadingDeg = wrap360(initialHeadingDeg + RIGHT_TURN_HEADING_SIGN * TURN_ANGLE_DEG);
+  rightTurnTargetHeadingDeg = wrap360(initialHeadingDeg + RIGHT_TURN_HEADING_SIGN * RIGHT_TURN_ANGLE_DEG);
+  leftTurnTargetHeadingDeg = wrap360(rightTurnTargetHeadingDeg + LEFT_TURN_HEADING_SIGN * LEFT_TURN_ANGLE_DEG);
 
   lastCompassDeg = targetHeadingDeg;
   headingErrDeg = 0.0f;
