@@ -1,13 +1,15 @@
 /*
   Rover control overview:
     - Startup compass calibration runs for COMPASS_CAL_MS.
-    - The heading when the start button is confirmed becomes the initial heading.
+    - The initial heading is the 1 s compass average taken after the start button is confirmed and before the rover starts.
     - Stage 1: drive straight for STAGE1_DISTANCE_M.
     - Turn right by RIGHT_TURN_ANGLE_DEG with a fixed steering command.
     - Stage 2: center steering, then drive straight for STAGE2_DISTANCE_M.
     - Turn left by LEFT_TURN_ANGLE_DEG with a fixed steering command.
     - Stage 3: center steering, then drive straight for STAGE3_DISTANCE_M.
-    - Stop the piston and center steering after Stage 3.
+    - Turn left by STAGE4_LEFT_TURN_ANGLE_DEG with a fixed steering command.
+    - Stage 4: center steering, then drive straight for STAGE4_DISTANCE_M.
+    - Stop the piston and center steering after Stage 4.
 
   Piston rule:
     - The first PISTON_PROFILE_1_CYCLES cycles use PISTON_PROFILE_1_ON_MS / PISTON_PROFILE_1_PERIOD_MS.
@@ -43,14 +45,19 @@
 /* ============================= User Config ============================= */
 
 // Mission profile.
-const float STAGE1_DISTANCE_M = 2.3f;                // First straight distance.
-const float RIGHT_TURN_ANGLE_DEG = 90.6f;            // Heading change for the right turn.
-const float STAGE2_DISTANCE_M = 18.3f;               // Second straight/cruise distance.
-const float LEFT_TURN_ANGLE_DEG = 75.0f;             // Heading change for the left turn.
-const float STAGE3_DISTANCE_M = 2.8f;                // Final straight distance after the left turn.
-const float TURN_DONE_TOL_DEG = 2.0f;                // Turn is done at target - tolerance.
-const float TURN_SERVO2_REMAINING_DEG = 10.0f;       // Use turn servo constant 2 within this remaining angle.
-const uint8_t TURN_DONE_CONFIRM_SAMPLES = 2;         // Consecutive 10 Hz confirmations.
+const float STAGE1_DISTANCE_M = 2.30f;//2.3
+const float RIGHT_TURN_ANGLE_DEG = 90.6f;
+const float STAGE2_DISTANCE_M = 11.7f;
+const float LEFT_TURN_ANGLE_DEG = 0.1f;
+const float STAGE3_DISTANCE_M = 3.63f;
+const float STAGE4_LEFT_TURN_ANGLE_DEG = 90.0f;
+const float STAGE4_DISTANCE_M = 3.0f;
+const float STAGE5_LEFT_TURN_ANGLE_DEG = 1.0f;
+const float STAGE5_DISTANCE_M = 4.0f;
+
+const float TURN_DONE_TOL_DEG = 2.0f;
+const float TURN_SERVO2_REMAINING_DEG = 10.0f;
+const uint8_t TURN_DONE_CONFIRM_SAMPLES = 2;
 
 // Pin map.
 const uint8_t PISTON_PIN = 2;
@@ -63,50 +70,51 @@ const uint8_t STATUS_LED_PIN = 13;
 
 // Timing.
 const uint32_t SERIAL_BAUD = 1000000UL;
-const uint16_t SAMPLE_MS = 10;                       // 100 Hz sample/log cycle.
-const uint16_t DECISION_MS = 100;                    // 10 Hz steering decision cycle.
-const uint16_t PISTON_PERIOD_MS = 900;             // Default total piston cycle period.
+const uint16_t SAMPLE_MS = 10;
+const uint16_t DECISION_MS = 100;
+const uint16_t PISTON_PERIOD_MS = 900;
 
-const uint16_t PISTON_PROFILE_1_ON_MS = 300;         // ON time for the first profile.
-const uint16_t PISTON_PROFILE_1_PERIOD_MS = 1000;    // Total cycle period for the first profile.
-const uint8_t PISTON_PROFILE_1_CYCLES = 5;           // Number of cycles using profile 1.
-const uint16_t PISTON_PROFILE_2_ON_MS = 200;         // ON time for the second profile.
-const uint16_t PISTON_PROFILE_2_PERIOD_MS = 1000;    // Total cycle period for the second profile.
-const uint8_t PISTON_PROFILE_2_CYCLES = 5;           // Number of cycles after profile 1.
+const uint16_t PISTON_PROFILE_1_ON_MS = 250;
+const uint16_t PISTON_PROFILE_1_PERIOD_MS = 1000;
 
-const uint16_t PISTON_DEFAULT_ON_MS =220;           // ON time after profiles 1 and 2.
+const uint8_t PISTON_PROFILE_1_CYCLES = 8;
+const uint16_t PISTON_PROFILE_2_ON_MS = 150;
+const uint16_t PISTON_PROFILE_2_PERIOD_MS = 700;
+const uint8_t PISTON_PROFILE_2_CYCLES = 3;
+
+const uint16_t PISTON_DEFAULT_ON_MS = 220;
 const uint16_t COMPASS_SETTLE_AFTER_OFF_MS = 20;
 const uint16_t COMPASS_CAL_MS = 15000;
 const uint16_t CAL_LED_TOGGLE_MS = 250;
 const uint16_t CAL_DONE_BLINK_MS = 1000;
-const uint16_t CAL_DONE_LED_TOGGLE_MS = 125;             // 4 Hz blink: toggle every 125 ms.
-const uint16_t START_BUTTON_HOLD_MS = 1000;               // Button must stay pressed to start.
+const uint16_t CAL_DONE_LED_TOGGLE_MS = 125;
+const uint16_t START_BUTTON_HOLD_MS = 500;
 const uint16_t START_BUTTON_POLL_MS = 5;
-const uint16_t START_AFTER_BUTTON_DELAY_MS = 14000;       // Wait after button confirmation before starting.
-const uint32_t RUN_TIMEOUT_MS = 60000UL;                  // Stop the rover after this run time.
-const uint8_t START_BUTTON_PRESSED_LEVEL = HIGH;         // Pin 8 idles LOW and goes HIGH when pressed.
+const uint16_t START_AFTER_BUTTON_DELAY_MS = 14000;
+const uint32_t RUN_TIMEOUT_MS = 60000UL;
+const uint8_t START_BUTTON_PRESSED_LEVEL = LOW;
 const uint16_t COMPASS_TIMEOUT_MS = 600;
 const uint32_t LIMIT_DEBOUNCE_US = 3000UL;
 
 // Steering.
 const int SERVO_PHYS_MIN_DEG = 65;
 const int SERVO_PHYS_MAX_DEG = 125;
-const int SERVO_STRAIGHT_MIN_DEG = 82;
-const int SERVO_STRAIGHT_MAX_DEG = 100;
-const int SERVO_CENTER_TRIM_DEG = 91;                // Tune if actual center is not 90.
-const int STEERING_SIGN = -1;                        // Flip if PID correction direction is reversed.
-const int RIGHT_TURN_SERVO_DEG = 105;                // Fixed right-turn steering command.
-const int RIGHT_TURN_SERVO_DEG2 = 94;                // Fixed right-turn steering command const 2.
+const int SERVO_STRAIGHT_MIN_DEG = 85;
+const int SERVO_STRAIGHT_MAX_DEG = 96;
+const int SERVO_CENTER_TRIM_DEG = 91;
+const int STEERING_SIGN = -1;
+const int RIGHT_TURN_SERVO_DEG = 105;
+const int RIGHT_TURN_SERVO_DEG2 = 94;
 
-const int LEFT_TURN_SERVO_DEG = 80;                  // Fixed left-turn steering command.
-const int LEFT_TURN_SERVO_DEG2 = 86;                  // Fixed left-turn steering command.
+const int LEFT_TURN_SERVO_DEG = 80;
+const int LEFT_TURN_SERVO_DEG2 = 86;
 
-const int RIGHT_TURN_HEADING_SIGN = +1;              // Use -1 if right turn decreases compass heading.
-const int LEFT_TURN_HEADING_SIGN = -1;               // Use +1 if left turn increases compass heading.
+const int RIGHT_TURN_HEADING_SIGN = +1;
+const int LEFT_TURN_HEADING_SIGN = -1;
 
 // Wheel and chassis geometry.
-const float TRACK_WIDTH_M = 0.188f;                  // 188 mm.
-const float TICK_M = 3.45f * 3.14f * 0.01f;          // One press = 3.45*pi cm ~= 0.10833 m.
+const float TRACK_WIDTH_M = 0.188f;
+const float TICK_M = 3.45f * 3.14f * 0.01f;
 
 // Compass calibration presets. Startup calibration overwrites runtime min/max values.
 const float MAG_MIN_X_PRESET = -1162.0f;
@@ -118,13 +126,13 @@ const float MAG_MAX_Z_PRESET = 1000.0f;
 const float MIN_USABLE_MAG_SPAN = 100.0f;
 const float HEADING_OFFSET_DEG = 0.0f;
 const float MAG_X_SIGN = 1.0f;
-const float MAG_Y_SIGN = 1.0f;                       // Flip one axis if heading is mirrored.
+const float MAG_Y_SIGN = 1.0f;
 
 // Heading-hold PID. Error unit is degree; output unit is servo degree.
 const float KP_HEADING = 1.20f;
 const float KI_HEADING = 0.01f;
 const float KD_HEADING = 0.08f;
-const float HEADING_DEADBAND_DEG = 2.0f;
+const float HEADING_DEADBAND_DEG = 0.1f;
 const float I_LIMIT_DEG_S = 80.0f;
 const float PID_LIMIT_DEG = 30.0f;
 
@@ -152,7 +160,11 @@ enum RoverPhase {
   PHASE_STRAIGHT_2 = 2,
   PHASE_TURN_LEFT = 3,
   PHASE_STRAIGHT_3 = 4,
-  PHASE_DONE = 5
+  PHASE_TURN_LEFT_STAGE4 = 5,
+  PHASE_STRAIGHT_4 = 6,
+  PHASE_TURN_LEFT_STAGE5 = 7,
+  PHASE_STRAIGHT_5 = 8,
+  PHASE_DONE = 9
 };
 
 RoverPhase phase = PHASE_STRAIGHT_1;
@@ -190,6 +202,8 @@ float initialHeadingDeg = NAN;
 float targetHeadingDeg = NAN;
 float rightTurnTargetHeadingDeg = NAN;
 float leftTurnTargetHeadingDeg = NAN;
+float stage4LeftTurnTargetHeadingDeg = NAN;
+float stage5LeftTurnTargetHeadingDeg = NAN;
 float turnStartHeadingDeg = NAN;
 float activeTurnAngleDeg = NAN;
 float lastCompassDeg = NAN;
@@ -278,11 +292,16 @@ float currentStraightTargetDistanceM() {
   if (phase == PHASE_STRAIGHT_1) return STAGE1_DISTANCE_M;
   if (phase == PHASE_STRAIGHT_2) return STAGE2_DISTANCE_M;
   if (phase == PHASE_STRAIGHT_3) return STAGE3_DISTANCE_M;
+  if (phase == PHASE_STRAIGHT_4) return STAGE4_DISTANCE_M;
+  if (phase == PHASE_STRAIGHT_5) return STAGE5_DISTANCE_M;
   return NAN;
 }
 
 bool isTurnPhase() {
-  return phase == PHASE_TURN_RIGHT || phase == PHASE_TURN_LEFT;
+  return phase == PHASE_TURN_RIGHT ||
+         phase == PHASE_TURN_LEFT ||
+         phase == PHASE_TURN_LEFT_STAGE4 ||
+         phase == PHASE_TURN_LEFT_STAGE5;
 }
 
 float turnProgressFromStartHeading() {
@@ -337,7 +356,7 @@ void blinkCalibrationDone() {
 void beginStartButtonMonitor() {
   pinMode(START_SIGNAL_PIN, OUTPUT);
   digitalWrite(START_SIGNAL_PIN, HIGH);
-  pinMode(START_BUTTON_PIN, INPUT);
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
 }
 
 bool startButtonPressed() {
@@ -349,13 +368,6 @@ void waitForStartButton() {
   writeServoDeg(SERVO_CENTER_TRIM_DEG);
 
   Serial.println(F("WAIT_START: hold start button for 0.5 s to begin."));
-
-  // Require a released state first, so a startup/high glitch cannot launch the rover.
-  while (startButtonPressed()) {
-    digitalWrite(PISTON_PIN, LOW);
-    writeServoDeg(SERVO_CENTER_TRIM_DEG);
-    delay(START_BUTTON_POLL_MS);
-  }
 
   uint32_t pressedStartMs = 0;
 
@@ -376,17 +388,49 @@ void waitForStartButton() {
   Serial.println(F("START_DETECTED"));
 }
 
-void waitAfterStartButtonDelay() {
-  Serial.println(F("START_DELAY: machine starts after 15 s."));
+float waitAfterStartButtonDelay() {
+  Serial.println(F("START_DELAY: machine starts after 14 s."));
+
+  const uint8_t INITIAL_HEADING_AVG_SAMPLES = 100;
 
   uint32_t delayStartMs = millis();
-  while ((uint32_t)(millis() - delayStartMs) < START_AFTER_BUTTON_DELAY_MS) {
+  uint32_t headingAvgStartMs = START_AFTER_BUTTON_DELAY_MS - 1000UL;
+  uint32_t nextStartBlinkMs = delayStartMs + CAL_DONE_LED_TOGGLE_MS;
+  bool startBlinkFinished = false;
+
+  statusLed = true;
+  digitalWrite(STATUS_LED_PIN, HIGH);
+
+  while ((uint32_t)(millis() - delayStartMs) < headingAvgStartMs) {
+    uint32_t nowMs = millis();
+    uint32_t elapsedMs = nowMs - delayStartMs;
+
+    if (elapsedMs < CAL_DONE_BLINK_MS) {
+      if ((int32_t)(nowMs - nextStartBlinkMs) >= 0) {
+        nextStartBlinkMs += CAL_DONE_LED_TOGGLE_MS;
+        statusLed = !statusLed;
+        digitalWrite(STATUS_LED_PIN, statusLed ? HIGH : LOW);
+      }
+    } else if (!startBlinkFinished) {
+      startBlinkFinished = true;
+      statusLed = false;
+      digitalWrite(STATUS_LED_PIN, LOW);
+    }
+
     digitalWrite(PISTON_PIN, LOW);
     writeServoDeg(SERVO_CENTER_TRIM_DEG);
     delay(START_BUTTON_POLL_MS);
   }
 
+  statusLed = false;
+  digitalWrite(STATUS_LED_PIN, LOW);
+  digitalWrite(PISTON_PIN, LOW);
+  writeServoDeg(SERVO_CENTER_TRIM_DEG);
+
+  float headingDeg = averageCompassHeading(INITIAL_HEADING_AVG_SAMPLES);
+
   Serial.println(F("MACHINE_START"));
+  return headingDeg;
 }
 
 void printFloatOrNan(float value, uint8_t digits) {
@@ -649,7 +693,9 @@ uint16_t currentPistonPeriodMs() {
 }
 
 void updatePiston(uint32_t nowMs, uint32_t nowUs) {
-  if (roverDone) {
+  if (roverDone ||
+      phase == PHASE_STRAIGHT_4 ||
+      phase == PHASE_STRAIGHT_5) {
     setPiston(false, nowUs);
     return;
   }
@@ -744,6 +790,24 @@ void beginLeftTurn() {
             LEFT_TURN_HEADING_SIGN);
 }
 
+void beginStage4LeftTurn() {
+  beginTurn(PHASE_TURN_LEFT_STAGE4,
+            stage4LeftTurnTargetHeadingDeg,
+            STAGE4_LEFT_TURN_ANGLE_DEG,
+            LEFT_TURN_SERVO_DEG,
+            LEFT_TURN_SERVO_DEG2,
+            LEFT_TURN_HEADING_SIGN);
+}
+
+void beginStage5LeftTurn() {
+  beginTurn(PHASE_TURN_LEFT_STAGE5,
+            stage5LeftTurnTargetHeadingDeg,
+            STAGE5_LEFT_TURN_ANGLE_DEG,
+            LEFT_TURN_SERVO_DEG,
+            LEFT_TURN_SERVO_DEG2,
+            LEFT_TURN_HEADING_SIGN);
+}
+
 void beginStraight(RoverPhase straightPhase, float straightTargetHeadingDeg) {
   phase = straightPhase;
   resetSegmentDistanceCounts();
@@ -772,6 +836,14 @@ void beginThirdStraight() {
   beginStraight(PHASE_STRAIGHT_3, leftTurnTargetHeadingDeg);
 }
 
+void beginFourthStraight() {
+  beginStraight(PHASE_STRAIGHT_4, stage4LeftTurnTargetHeadingDeg);
+}
+
+void beginFifthStraight() {
+  beginStraight(PHASE_STRAIGHT_5, stage5LeftTurnTargetHeadingDeg);
+}
+
 void finishRover() {
   phase = PHASE_DONE;
   roverDone = true;
@@ -791,7 +863,9 @@ void updateDistanceFromLimitSwitches() {
 
   if (phase == PHASE_STRAIGHT_1) beginRightTurn();
   else if (phase == PHASE_STRAIGHT_2) beginLeftTurn();
-  else if (phase == PHASE_STRAIGHT_3) finishRover();
+  else if (phase == PHASE_STRAIGHT_3) beginStage4LeftTurn();
+  else if (phase == PHASE_STRAIGHT_4) beginStage5LeftTurn();
+  else if (phase == PHASE_STRAIGHT_5) finishRover();
 }
 
 void updateTurnDecision() {
@@ -815,6 +889,8 @@ void updateTurnDecision() {
 
   if (phase == PHASE_TURN_RIGHT) beginSecondStraight();
   else if (phase == PHASE_TURN_LEFT) beginThirdStraight();
+  else if (phase == PHASE_TURN_LEFT_STAGE4) beginFourthStraight();
+  else if (phase == PHASE_TURN_LEFT_STAGE5) beginFifthStraight();
 }
 
 void updateStraightSteering(uint32_t nowMs) {
@@ -917,17 +993,18 @@ void setup() {
   blinkCalibrationDone();
   waitForStartButton();
 
-  initialHeadingDeg = averageCompassHeading(25);
+  initialHeadingDeg = waitAfterStartButtonDelay();
+
   targetHeadingDeg = initialHeadingDeg;
   rightTurnTargetHeadingDeg = wrap360(initialHeadingDeg + RIGHT_TURN_HEADING_SIGN * RIGHT_TURN_ANGLE_DEG);
   leftTurnTargetHeadingDeg = wrap360(rightTurnTargetHeadingDeg + LEFT_TURN_HEADING_SIGN * LEFT_TURN_ANGLE_DEG);
+  stage4LeftTurnTargetHeadingDeg = wrap360(leftTurnTargetHeadingDeg + LEFT_TURN_HEADING_SIGN * STAGE4_LEFT_TURN_ANGLE_DEG);
+  stage5LeftTurnTargetHeadingDeg = wrap360(stage4LeftTurnTargetHeadingDeg + LEFT_TURN_HEADING_SIGN * STAGE5_LEFT_TURN_ANGLE_DEG);
 
   lastCompassDeg = targetHeadingDeg;
   headingErrDeg = 0.0f;
   lastCompassMs = millis();
   compassValid = true;
-
-  waitAfterStartButtonDelay();
 
   uint32_t nowUs = micros();
   uint32_t nowMs = millis();
