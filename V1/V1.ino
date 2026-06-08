@@ -45,14 +45,14 @@
 /* ============================= User Config ============================= */
 
 // Mission profile.
-const float STAGE1_DISTANCE_M = 2.30f;//2.3
+const float STAGE1_DISTANCE_M = 2.15f;
 const float RIGHT_TURN_ANGLE_DEG = 90.6f;
-const float STAGE2_DISTANCE_M = 11.7f;
-const float LEFT_TURN_ANGLE_DEG = 0.1f;
-const float STAGE3_DISTANCE_M = 3.63f;
+const float STAGE2_DISTANCE_M = 14.5f;
+const float LEFT_TURN_ANGLE_DEG = 0.0f;
+const float STAGE3_DISTANCE_M = 0.1f;
 const float STAGE4_LEFT_TURN_ANGLE_DEG = 90.0f;
-const float STAGE4_DISTANCE_M = 3.0f;
-const float STAGE5_LEFT_TURN_ANGLE_DEG = 1.0f;
+const float STAGE4_DISTANCE_M = 2.3f;
+const float STAGE5_LEFT_TURN_ANGLE_DEG = 90.0f;
 const float STAGE5_DISTANCE_M = 4.0f;
 
 const float TURN_DONE_TOL_DEG = 2.0f;
@@ -72,15 +72,16 @@ const uint8_t STATUS_LED_PIN = 13;
 const uint32_t SERIAL_BAUD = 1000000UL;
 const uint16_t SAMPLE_MS = 10;
 const uint16_t DECISION_MS = 100;
-const uint16_t PISTON_PERIOD_MS = 900;
+const uint16_t PISTON_PERIOD_MS = 1700;
 
-const uint16_t PISTON_PROFILE_1_ON_MS = 250;
-const uint16_t PISTON_PROFILE_1_PERIOD_MS = 1000;
+const uint16_t PISTON_PROFILE_1_ON_MS = 150;
+const uint16_t PISTON_PROFILE_1_PERIOD_MS = 1800;
 
 const uint8_t PISTON_PROFILE_1_CYCLES = 8;
+
 const uint16_t PISTON_PROFILE_2_ON_MS = 150;
 const uint16_t PISTON_PROFILE_2_PERIOD_MS = 700;
-const uint8_t PISTON_PROFILE_2_CYCLES = 3;
+const uint8_t PISTON_PROFILE_2_CYCLES = 1;
 
 const uint16_t PISTON_DEFAULT_ON_MS = 220;
 const uint16_t COMPASS_SETTLE_AFTER_OFF_MS = 20;
@@ -99,8 +100,8 @@ const uint32_t LIMIT_DEBOUNCE_US = 3000UL;
 // Steering.
 const int SERVO_PHYS_MIN_DEG = 65;
 const int SERVO_PHYS_MAX_DEG = 125;
-const int SERVO_STRAIGHT_MIN_DEG = 85;
-const int SERVO_STRAIGHT_MAX_DEG = 96;
+const int SERVO_STRAIGHT_MIN_DEG = 88;
+const int SERVO_STRAIGHT_MAX_DEG = 95;
 const int SERVO_CENTER_TRIM_DEG = 91;
 const int STEERING_SIGN = -1;
 const int RIGHT_TURN_SERVO_DEG = 105;
@@ -114,7 +115,7 @@ const int LEFT_TURN_HEADING_SIGN = -1;
 
 // Wheel and chassis geometry.
 const float TRACK_WIDTH_M = 0.188f;
-const float TICK_M = 3.45f * 3.14f * 0.01f;
+const float TICK_M = 0.5f * 3.45f * 3.14f * 0.01f;
 
 // Compass calibration presets. Startup calibration overwrites runtime min/max values.
 const float MAG_MIN_X_PRESET = -1162.0f;
@@ -129,9 +130,9 @@ const float MAG_X_SIGN = 1.0f;
 const float MAG_Y_SIGN = 1.0f;
 
 // Heading-hold PID. Error unit is degree; output unit is servo degree.
-const float KP_HEADING = 1.20f;
+const float KP_HEADING = 0.60f;  //Originally 1.2,0.01,0.08
 const float KI_HEADING = 0.01f;
-const float KD_HEADING = 0.08f;
+const float KD_HEADING = 0.04f;
 const float HEADING_DEADBAND_DEG = 0.1f;
 const float I_LIMIT_DEG_S = 80.0f;
 const float PID_LIMIT_DEG = 30.0f;
